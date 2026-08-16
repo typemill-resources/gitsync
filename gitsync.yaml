@@ -1,0 +1,116 @@
+name: GitSync
+version: 1.0.0
+description: Sync your content with one or more GitHub or GitLab repositories (push and pull).
+author: Sebastian Schürmanns
+homepage: https://trendschau.net
+repo: https://github.com/typemill-resources/gitsync
+license: BUSINESS
+
+forms:
+  fields:
+
+    github_token:
+      type: password
+      label: 'Git Personal Access Token'
+      description: 'For GitHub: fine-grained token with "contents: read and write". For GitLab: token with api scope.'
+      placeholder: 'ghp_***************'
+
+    timeout:
+      type: number
+      label: 'API Timeout (seconds)'
+      default: 60
+      description: 'Adjust only if you encounter timeout issues during sync.'
+
+metatabs:
+  GitSync:
+    fields: {}
+
+connection_form:
+  fields:
+    tmsettings: 
+      type: fieldset
+      legend: 'Typemill Settings'
+      fields:
+        id:
+          type: text
+          label: 'ID'
+          description: 'A unique internal identifier for this repository connection, for example "framework" or "api-docs". You will use this ID later to pull or push content. It cannot be changed after creation.'
+          placeholder: 'framework'
+
+        local_folder:
+          type: text
+          label: 'Local Folder'
+          description: 'The subfolder under /content where the repository files will be stored. Leave empty to sync directly into /content (root). Use simple names like "framework" or "docs/api".'
+          placeholder: 'framework'
+          css: 'lg:w-half'
+
+        file_pattern:
+          type: text
+          label: 'File Pattern'
+          description: 'Optional glob pattern to filter which files are synced. Leave empty for all Markdown files. Example: "*.md" or "index.md".'
+          placeholder: '*.md'
+          css: 'lg:w-half'
+
+    gitsettings: 
+      type: fieldset
+      legend: 'Git Settings'
+      fields:
+        platform:
+          type: select
+          label: 'Git Platform'
+          description: 'The Git hosting platform for this repository.'
+          options:
+            github: 'GitHub'
+            gitlab: 'GitLab'
+          default: github
+          css: 'lg:w-half'
+
+        api_base_url:
+          type: text
+          label: 'API Base URL'
+          description: 'Optional custom API base URL. Leave empty for the platform default. Only needed for self-hosted GitLab or GitHub Enterprise instances.'
+          placeholder: 'https://gitlab.example.com/api/v4'
+          css: 'lg:w-half'
+
+        owner:
+          type: text
+          label: 'Owner / Organization'
+          description: 'The username or organization name that owns the repository on the selected platform.'
+          placeholder: 'companyname'
+          css: 'lg:w-half'
+
+        repo:
+          type: text
+          label: 'Repository Name'
+          description: 'The name of the repository you want to sync.'
+          placeholder: 'my-documentation'
+          css: 'lg:w-half'
+
+        branch:
+          type: text
+          label: 'Branch'
+          description: 'The Git branch to synchronize with. Most repositories use "main".'
+          placeholder: 'main'
+          css: 'lg:w-half'
+
+        repo_path:
+          type: text
+          label: 'Source Path in Repo'
+          description: 'Sync only a specific folder or file from the repository. Leave empty to sync the entire repository. Example: "docs" or "getting-started.md".'
+          placeholder: 'docs'
+          css: 'lg:w-half'
+
+        auto_sync:
+          type: checkbox
+          label: 'Auto-sync on frontend'
+          description: 'Automatically pull and push this repository in the background while visitors browse the frontend.'
+          default: false
+          css: 'lg:w-half'
+
+        auto_sync_interval:
+          type: number
+          label: 'Auto-sync interval (minutes)'
+          description: 'Minimum time between automatic syncs for this connection.'
+          default: 10
+          min: 1
+          css: 'lg:w-half'
