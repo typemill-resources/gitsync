@@ -11,6 +11,7 @@ abstract class GitPlatformClient
     protected $timeout = 60;
     protected $apiBaseUrl;
     protected $lastError = null;
+    protected $lastHttpCode = null;
 
     public function __construct(array $config)
     {
@@ -25,6 +26,11 @@ abstract class GitPlatformClient
     public function getLastError()
     {
         return $this->lastError;
+    }
+
+    public function getLastHttpCode()
+    {
+        return $this->lastHttpCode;
     }
 
     public static function factory(array $config): self
@@ -55,13 +61,13 @@ abstract class GitPlatformClient
         curl_setopt($curl, CURLOPT_TIMEOUT, $this->timeout);
         curl_setopt($curl, CURLOPT_HTTPHEADER, $headers);
 
-        if ($method === 'POST' || $method === 'PUT') {
+        if ($method === 'POST' || $method === 'PUT' || $method === 'DELETE') {
             curl_setopt($curl, CURLOPT_CUSTOMREQUEST, $method);
             if ($data !== null) {
                 $json = json_encode($data);
                 if ($json === false) {
                     $this->lastError = 'JSON encoding error: ' . json_last_error_msg();
-                    curl_close($curl);
+                    unset($curl);
                     return false;
                 }
                 curl_setopt($curl, CURLOPT_POSTFIELDS, $json);
@@ -71,13 +77,14 @@ abstract class GitPlatformClient
         }
 
         $response = curl_exec($curl);
+        $this->lastHttpCode = curl_getinfo($curl, CURLINFO_HTTP_CODE);
         if ($response === false) {
             $this->lastError = curl_error($curl);
-            curl_close($curl);
+            unset($curl);
             return false;
         }
 
-        curl_close($curl);
+        unset($curl);
         return $response;
     }
 
@@ -110,4 +117,10 @@ abstract class GitPlatformClient
      * @return array ['sha' => string]|bool
      */
     abstract public function updateFile(string $path, string $content, string $message, ?string $existingSha = null);
+
+    /**
+     * Delete a file on the remote.
+     * @return array ['commit_sha' => string|null]|bool
+     */
+    abstract public function deleteFile(string $path, string $message, ?string $existingSha = null);
 }

@@ -1,5 +1,5 @@
 name: GitSync
-version: 1.0.0
+version: 1.3.0
 description: Sync your content with one or more GitHub or GitLab repositories (push and pull).
 author: Sebastian Schürmanns
 homepage: https://trendschau.net
@@ -39,9 +39,16 @@ connection_form:
 
         local_folder:
           type: text
-          label: 'Local Folder'
+          label: 'Include Local Folder'
           description: 'The subfolder under /content where the repository files will be stored. Leave empty to sync directly into /content (root). Use simple names like "framework" or "docs/api".'
           placeholder: 'framework'
+          css: 'lg:w-half'
+
+        exclude_folders:
+          type: text
+          label: 'Exclude Local Folders'
+          description: 'Optional comma separated list of local folders to exclude from syncing, e.g. "_de, _en, myfolder/secret". Files inside these folders are not pulled and not pushed.'
+          placeholder: '_de, _en, myfolder/secret'
           css: 'lg:w-half'
 
         file_pattern:

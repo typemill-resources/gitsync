@@ -98,11 +98,16 @@ class GitHubClient extends GitPlatformClient
 
         $files = [];
         foreach ($data['files'] ?? [] as $file) {
-            $files[] = [
+            $entry = [
                 'filename' => $file['filename'],
                 'status' => $file['status'],
                 'sha' => $file['sha'] ?? null
             ];
+            # Renames carry the old path in previous_filename
+            if (isset($file['previous_filename'])) {
+                $entry['previous_filename'] = $file['previous_filename'];
+            }
+            $files[] = $entry;
         }
         return $files;
     }
@@ -155,6 +160,47 @@ class GitHubClient extends GitPlatformClient
 
         return [
             'sha' => $data['content']['sha'] ?? null,
+            'commit_sha' => $data['commit']['sha'] ?? null
+        ];
+    }
+
+    public function deleteFile(string $path, string $message, ?string $existingSha = null)
+    {
+        # GitHub requires the current blob sha of the file to delete
+        if (!$existingSha) {
+            $file = $this->getFile($path);
+            if ($file === false) {
+                # A file that is already gone remotely does not need to be deleted
+                if (stripos($this->getLastError() ?? '', 'Not Found') !== false) {
+                    return ['commit_sha' => null];
+                }
+                return false;
+            }
+            $existingSha = $file['sha'];
+        }
+
+        $url = "{$this->apiBaseUrl}/repos/{$this->owner}/{$this->repo}/contents/{$path}";
+        $payload = [
+            'message' => $message,
+            'sha' => $existingSha,
+            'branch' => $this->branch
+        ];
+
+        $response = $this->makeRequest('DELETE', $url, $this->getAuthHeaders(), $payload);
+        if (!$response) {
+            return false;
+        }
+
+        $data = $this->parseResponse($response);
+        if (!$data) {
+            # A file that is already gone remotely does not need to be deleted
+            if (stripos($this->getLastError() ?? '', 'Not Found') !== false) {
+                return ['commit_sha' => null];
+            }
+            return false;
+        }
+
+        return [
             'commit_sha' => $data['commit']['sha'] ?? null
         ];
     }

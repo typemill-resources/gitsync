@@ -99,6 +99,14 @@ class Gitsync extends Plugin
                 'privilege'     => 'update'
             ],
             [
+                'httpMethod'    => 'post',
+                'route'         => '/api/v1/gitsync/resolve/{id}',
+                'name'          => 'gitsync.resolve',
+                'class'         => 'Plugins\Gitsync\Gitsync:resolveConnection',
+                'resource'      => 'system',
+                'privilege'     => 'update'
+            ],
+            [
                 'httpMethod'    => 'get',
                 'route'         => '/api/v1/gitsync/status/{id}',
                 'name'          => 'gitsync.status',
@@ -183,6 +191,7 @@ class Gitsync extends Plugin
         $apiBaseUrl = $params['api_base_url'] ?? '';
         $repoPath = isset($params['repo_path']) ? $this->sanitizeRepoPath($params['repo_path']) : '';
         $filePattern = isset($params['file_pattern']) ? trim($params['file_pattern']) : '';
+        $excludeFolders = $this->parseExcludeFolders($params['exclude_folders'] ?? '', true);
 
         if (!$id || !$owner || !$repo)
         {
@@ -195,7 +204,17 @@ class Gitsync extends Plugin
             return $this->errorResponse($response, 'Invalid local folder path', 400, []);
         }
 
-        $data = $this->getPluginYamlData('gitsync.yaml') ?? [];
+        if ($excludeFolders === false)
+        {
+            return $this->errorResponse($response, 'Invalid exclude folders. Use a comma separated list like "_de, _en, myfolder/secret" (letters, numbers, dashes, underscores and slashes only).', 400, []);
+        }
+
+        $data = $this->getPluginYamlData('gitsync.yaml');
+        if (!is_array($data))
+        {
+            # getYaml returns false when the data file does not exist yet
+            $data = [];
+        }
         if (!isset($data['connections']))
         {
             $data['connections'] = [];
@@ -212,6 +231,7 @@ class Gitsync extends Plugin
             'repo'                  => $repo,
             'branch'                => $branch,
             'local_folder'          => $localFolder,
+            'exclude_folders'       => implode(',', $excludeFolders),
             'platform'              => $platform,
             'api_base_url'          => $apiBaseUrl,
             'repo_path'             => $repoPath,
@@ -257,10 +277,17 @@ class Gitsync extends Plugin
             return $this->errorResponse($response, 'Invalid local folder path', 400, []);
         }
 
+        $excludeFolders = isset($params['exclude_folders']) ? $this->parseExcludeFolders($params['exclude_folders'], true) : null;
+        if ($excludeFolders === false)
+        {
+            return $this->errorResponse($response, 'Invalid exclude folders. Use a comma separated list like "_de, _en, myfolder/secret" (letters, numbers, dashes, underscores and slashes only).', 400, []);
+        }
+
         $data['connections'][$id]['owner'] = $params['owner'] ?? $data['connections'][$id]['owner'];
         $data['connections'][$id]['repo'] = $params['repo'] ?? $data['connections'][$id]['repo'];
         $data['connections'][$id]['branch'] = $params['branch'] ?? $data['connections'][$id]['branch'];
         $data['connections'][$id]['local_folder'] = $localFolder;
+        $data['connections'][$id]['exclude_folders'] = $excludeFolders === null ? ($data['connections'][$id]['exclude_folders'] ?? '') : implode(',', $excludeFolders);
         $data['connections'][$id]['platform'] = $params['platform'] ?? $data['connections'][$id]['platform'];
         $data['connections'][$id]['api_base_url'] = $params['api_base_url'] ?? $data['connections'][$id]['api_base_url'];
         $data['connections'][$id]['repo_path'] = isset($params['repo_path']) ? $this->sanitizeRepoPath($params['repo_path']) : ($data['connections'][$id]['repo_path'] ?? '');
@@ -354,6 +381,8 @@ class Gitsync extends Plugin
         ini_set('memory_limit', '256M');
 
         $connectionId = $args['id'] ?? false;
+        $params = $request->getParsedBody() ?? [];
+        $force = !empty($params['force']);
 
         $pluginData = $this->getPluginYamlData('gitsync.yaml') ?? [];
         $connections = $pluginData['connections'] ?? [];
@@ -369,7 +398,7 @@ class Gitsync extends Plugin
         }
 
         $connection = $connections[$connectionId];
-        $result = $this->performPull($connectionId, $connection, $pluginData);
+        $result = $this->performPull($connectionId, $connection, $pluginData, $force);
 
         $pluginData = $result['pluginData'];
         $this->storePluginYamlData('gitsync.yaml', $pluginData);
@@ -387,6 +416,7 @@ class Gitsync extends Plugin
                 'message'   => $result['message'],
                 'files'     => $result['files'],
                 'deleted'   => $result['deleted'],
+                'renamed'   => $result['renamed'] ?? 0,
                 'skipped'   => $result['skipped'],
                 'detail'    => $result['detail'],
                 'history'   => $result['history']
@@ -401,25 +431,24 @@ class Gitsync extends Plugin
     /**
      * Internal pull logic shared by the HTTP endpoint and auto-sync.
      *
+     * @param bool $force Skip the conflict check: remote changes win and
+     *                    overwrite locally modified files.
      * @return array Pull result with keys: success, status_code, message,
-     *               pluginData, files, deleted, skipped, conflicts, detail,
-     *               history, already_up_to_date.
+     *               pluginData, files, deleted, renamed, skipped, conflicts,
+     *               detail, history, already_up_to_date.
      */
-    private function performPull(string $connectionId, array $connection, array $pluginData): array
+    private function performPull(string $connectionId, array $connection, array $pluginData, bool $force = false): array
     {
+        $actionName = $force ? 'force-pull' : 'pull';
+
         $localFolder = $connection['local_folder'];
 
-        $pluginSettings = $this->getPluginSettings();
-        $timeout = isset($pluginSettings['timeout']) ? (int) $pluginSettings['timeout'] : 60;
-        if ($timeout < 5) { $timeout = 5; }
-
-        $settingsModel = new Settings();
-        $apikey = $settingsModel->getSecret('github_token', 'plugins', 'gitsync');
+        $apikey = $this->getGitToken();
 
         if (!$apikey)
         {
             $pluginData = $this->addHistoryEntry($pluginData, [
-                'action'        => 'pull',
+                'action'        => $actionName,
                 'connection_id' => $connectionId,
                 'status'        => 'error',
                 'files'         => 0,
@@ -440,21 +469,13 @@ class Gitsync extends Plugin
             ];
         }
 
-        $client = GitPlatformClient::factory([
-            'platform'      => $connection['platform'] ?? 'github',
-            'owner'         => $connection['owner'],
-            'repo'          => $connection['repo'],
-            'branch'        => $connection['branch'] ?? 'main',
-            'token'         => $apikey,
-            'timeout'       => $timeout,
-            'api_base_url'  => $connection['api_base_url'] ?? ''
-        ]);
+        $client = $this->createClient($connection, $apikey, $this->getTimeout());
 
         $lastRemoteSha = $client->getLatestCommitSha();
         if (!$lastRemoteSha)
         {
             $pluginData = $this->addHistoryEntry($pluginData, [
-                'action'        => 'pull',
+                'action'        => $actionName,
                 'connection_id' => $connectionId,
                 'status'        => 'error',
                 'files'         => 0,
@@ -497,9 +518,11 @@ class Gitsync extends Plugin
         $files = $connection['files'] ?? [];
         $filesProcessed = 0;
         $filesDeleted = 0;
+        $filesRenamed = 0;
         $filesSkipped = 0;
         $repoPath = $connection['repo_path'] ?? '';
         $filePattern = $connection['file_pattern'] ?? '';
+        $excludeFolders = $this->parseExcludeFolders($connection['exclude_folders'] ?? '');
 
         if (!$lastKnownSha)
         {
@@ -508,7 +531,7 @@ class Gitsync extends Plugin
             if ($treeItems === false)
             {
                 $pluginData = $this->addHistoryEntry($pluginData, [
-                    'action'        => 'pull',
+                    'action'        => $actionName,
                     'connection_id' => $connectionId,
                     'status'        => 'error',
                     'files'         => 0,
@@ -532,7 +555,7 @@ class Gitsync extends Plugin
             foreach ($treeItems as $item)
             {
                 $filename = $item['path'];
-                if (!$this->shouldSyncFile($filename, $repoPath, $filePattern))
+                if (!$this->shouldSyncFile($filename, $repoPath, $filePattern, $excludeFolders))
                 {
                     $filesSkipped++;
                     continue;
@@ -557,7 +580,7 @@ class Gitsync extends Plugin
             if ($changedFiles === false)
             {
                 $pluginData = $this->addHistoryEntry($pluginData, [
-                    'action'        => 'pull',
+                    'action'        => $actionName,
                     'connection_id' => $connectionId,
                     'status'        => 'error',
                     'files'         => 0,
@@ -583,40 +606,49 @@ class Gitsync extends Plugin
             foreach ($changedFiles as $file)
             {
                 $filename = $file['filename'];
-                if (!$this->shouldSyncFile($filename, $repoPath, $filePattern))
+                if ($this->shouldSyncFile($filename, $repoPath, $filePattern, $excludeFolders))
                 {
-                    continue;
+                    $localPath = $this->localPathFromRepoPath($repoPath, $filename);
+                    $localContent = $this->readContentFile($localFolder, $localPath);
+
+                    # File exists locally -> check for unpushed changes
+                    if ($localContent !== false)
+                    {
+                        $localHash = sha1($localContent);
+
+                        # If no stored hash, file was added locally after last sync
+                        # If local hash differs from stored hash, local was modified
+                        if (!isset($files[$filename]['local_hash']) || $files[$filename]['local_hash'] !== $localHash)
+                        {
+                            $conflicts[] = $filename;
+                        }
+                    }
                 }
 
-                $localPath = $this->localPathFromRepoPath($repoPath, $filename);
-                $localContent = $this->readContentFile($localFolder, $localPath);
-
-                # File does not exist locally -> no conflict
-                if ($localContent === false)
+                # For renames, also check the old path: the pull deletes it locally
+                $previous = $file['previous_filename'] ?? null;
+                if (($file['status'] ?? '') === 'renamed' && $previous && $previous !== $filename
+                    && $this->shouldSyncFile($previous, $repoPath, $filePattern, $excludeFolders))
                 {
-                    continue;
-                }
+                    $oldLocalPath = $this->localPathFromRepoPath($repoPath, $previous);
+                    $oldLocalContent = $this->readContentFile($localFolder, $oldLocalPath);
 
-                $localHash = sha1($localContent);
-
-                # If no stored hash, file was added locally after last sync
-                if (!isset($files[$filename]['local_hash']))
-                {
-                    $conflicts[] = $filename;
-                    continue;
-                }
-
-                # If local hash differs from stored hash, local was modified
-                if ($files[$filename]['local_hash'] !== $localHash)
-                {
-                    $conflicts[] = $filename;
+                    # Old file exists locally -> conflict if it has unpushed changes
+                    if ($oldLocalContent !== false)
+                    {
+                        $oldLocalHash = sha1($oldLocalContent);
+                        if (!isset($files[$previous]['local_hash']) || $files[$previous]['local_hash'] !== $oldLocalHash)
+                        {
+                            $conflicts[] = $previous;
+                        }
+                    }
                 }
             }
 
-            if (!empty($conflicts))
+            if (!empty($conflicts) && !$force)
             {
                 $pluginData = $this->addHistoryEntry($pluginData, [
-                    'action'        => 'pull',
+                    'action'        => $actionName,
                     'connection_id' => $connectionId,
                     'status'        => 'error',
                     'files'         => 0,
@@ -640,7 +672,18 @@ class Gitsync extends Plugin
             foreach ($changedFiles as $file)
             {
                 $filename = $file['filename'];
-                if (!$this->shouldSyncFile($filename, $repoPath, $filePattern))
+                $previous = $file['previous_filename'] ?? null;
+                $isRename = (($file['status'] ?? '') === 'renamed') && !empty($previous) && $previous !== $filename;
+
+                # For renames, delete the old local file first (if it is in sync scope)
+                if ($isRename && $this->shouldSyncFile($previous, $repoPath, $filePattern, $excludeFolders))
+                {
+                    $oldLocalPath = $this->localPathFromRepoPath($repoPath, $previous);
+                    $this->deleteContentFile($localFolder, $oldLocalPath);
+                    unset($files[$previous]);
+                }
+
+                if (!$this->shouldSyncFile($filename, $repoPath, $filePattern, $excludeFolders))
                 {
                     $filesSkipped++;
                     continue;
@@ -664,7 +707,15 @@ class Gitsync extends Plugin
                     'remote_sha' => $file['sha'],
                     'local_hash' => sha1($fileData['content'])
                 ];
-                $filesProcessed++;
+
+                if ($isRename)
+                {
+                    $filesRenamed++;
+                }
+                else
+                {
+                    $filesProcessed++;
+                }
             }
         }
 
@@ -675,7 +726,11 @@ class Gitsync extends Plugin
             $pluginData['connections'][$connectionId]['files'] = $files;
         }
 
-        $detail = 'Pulled ' . $filesProcessed . ' file' . ($filesProcessed !== 1 ? 's' : '');
+        $detail = ($force ? 'Forced pull: pulled ' : 'Pulled ') . $filesProcessed . ' file' . ($filesProcessed !== 1 ? 's' : '');
+        if ($filesRenamed > 0)
+        {
+            $detail .= ', renamed ' . $filesRenamed;
+        }
         if ($filesDeleted > 0)
         {
             $detail .= ', deleted ' . $filesDeleted;
@@ -686,7 +741,7 @@ class Gitsync extends Plugin
         }
 
         $pluginData = $this->addHistoryEntry($pluginData, [
-            'action'        => 'pull',
+            'action'        => $actionName,
             'connection_id' => $connectionId,
             'status'        => 'success',
             'files'         => $filesProcessed,
@@ -700,6 +755,7 @@ class Gitsync extends Plugin
             'pluginData'    => $pluginData,
             'files'         => $filesProcessed,
             'deleted'       => $filesDeleted,
+            'renamed'       => $filesRenamed,
             'skipped'       => $filesSkipped,
             'conflicts'     => [],
             'detail'        => $detail,
@@ -734,7 +790,8 @@ class Gitsync extends Plugin
 
         $connection = $connections[$connectionId];
         $commitMessage = $params['message'] ?? null;
-        $result = $this->performPush($connectionId, $connection, $pluginData, $commitMessage);
+        $force = !empty($params['force']);
+        $result = $this->performPush($connectionId, $connection, $pluginData, $commitMessage, $force);
 
         $pluginData = $result['pluginData'];
 
@@ -751,6 +808,7 @@ class Gitsync extends Plugin
             $response->getBody()->write(json_encode([
                 'message'   => $result['message'],
                 'files'     => $result['files'],
+                'deleted'   => $result['deleted'] ?? 0,
                 'skipped'   => $result['skipped'],
                 'detail'    => $result['detail'],
                 'history'   => $result['history']
@@ -769,25 +827,24 @@ class Gitsync extends Plugin
      * @param array $connection
      * @param array $pluginData
      * @param string|null $commitMessage Custom commit message; falls back to 'Updated from Typemill'.
+     * @param bool $force Skip the conflict checks: local changes win and
+     *                    overwrite remotely modified files.
      * @return array Push result with keys: success, status_code, message, pluginData,
      *               files, skipped, conflicts, detail, history.
      */
-    private function performPush(string $connectionId, array $connection, array $pluginData, ?string $commitMessage = null): array
+    private function performPush(string $connectionId, array $connection, array $pluginData, ?string $commitMessage = null, bool $force = false): array
     {
+        $actionName = $force ? 'force-push' : 'push';
+
         $localFolder = $connection['local_folder'];
         $files = $connection['files'] ?? [];
 
-        $pluginSettings = $this->getPluginSettings();
-        $timeout = isset($pluginSettings['timeout']) ? (int) $pluginSettings['timeout'] : 60;
-        if ($timeout < 5) { $timeout = 5; }
-
-        $settingsModel = new Settings();
-        $apikey = $settingsModel->getSecret('github_token', 'plugins', 'gitsync');
+        $apikey = $this->getGitToken();
 
         if (!$apikey)
         {
             $pluginData = $this->addHistoryEntry($pluginData, [
-                'action'        => 'push',
+                'action'        => $actionName,
                 'connection_id' => $connectionId,
                 'status'        => 'error',
                 'files'         => 0,
@@ -806,18 +863,11 @@ class Gitsync extends Plugin
             ];
         }
 
-        $client = GitPlatformClient::factory([
-            'platform'      => $connection['platform'] ?? 'github',
-            'owner'         => $connection['owner'],
-            'repo'          => $connection['repo'],
-            'branch'        => $connection['branch'] ?? 'main',
-            'token'         => $apikey,
-            'timeout'       => $timeout,
-            'api_base_url'  => $connection['api_base_url'] ?? ''
-        ]);
+        $client = $this->createClient($connection, $apikey, $this->getTimeout());
 
         $repoPath = $connection['repo_path'] ?? '';
         $filePattern = $connection['file_pattern'] ?? '';
+        $excludeFolders = $this->parseExcludeFolders($connection['exclude_folders'] ?? '');
 
         $defaultMessage = $commitMessage ?? 'Updated from Typemill';
 
@@ -828,6 +878,100 @@ class Gitsync extends Plugin
         $conflicts = [];
         $updatedFiles = $files;
         $lastCommitSha = null;
+
+        # Detect orphans: tracked files inside the sync scope that no longer exist
+        # locally (renamed, moved or deleted in Typemill). Their remote counterparts
+        # must be deleted, otherwise every reorder or move duplicates content remotely.
+        $localRemotePaths = [];
+        foreach ($localFiles as $relativePath)
+        {
+            $localRemotePath = $this->repoFilePathFromLocalPath($repoPath, $relativePath);
+            if ($this->matchesPattern($localRemotePath, $filePattern))
+            {
+                $localRemotePaths[$localRemotePath] = true;
+            }
+        }
+
+        $orphanDeletions = [];
+        foreach (array_keys($files) as $trackedPath)
+        {
+            # Scope guard: never touch remote files outside repo_path / file_pattern
+            if (!$this->shouldSyncFile($trackedPath, $repoPath, $filePattern, $excludeFolders))
+            {
+                continue;
+            }
+            if (isset($localRemotePaths[$trackedPath]))
+            {
+                continue;
+            }
+
+            # Fetch the current remote state for the conflict check and the deletion sha
+            $remoteFile = $client->getFile($trackedPath);
+            if ($remoteFile === false)
+            {
+                $error = $client->getLastError();
+                if (stripos($error ?? '', 'Not Found') !== false)
+                {
+                    # Already gone remotely, just drop it from the tracking map
+                    unset($updatedFiles[$trackedPath]);
+                    continue;
+                }
+
+                $pluginData = $this->addHistoryEntry($pluginData, [
+                    'action'        => $actionName,
+                    'connection_id' => $connectionId,
+                    'status'        => 'error',
+                    'files'         => 0,
+                    'message'       => 'Git API error for ' . $trackedPath . ': ' . $error
+                ]);
+                return [
+                    'success'       => false,
+                    'status_code'   => 400,
+                    'message'       => 'Git API error for ' . $trackedPath . ': ' . $error,
+                    'pluginData'    => $pluginData,
+                    'files'         => 0,
+                    'skipped'       => 0,
+                    'conflicts'     => [],
+                    'detail'        => '',
+                    'history'       => $pluginData['history'] ?? []
+                ];
+            }
+
+            $storedSha = $files[$trackedPath]['remote_sha'] ?? null;
+            $currentSha = $remoteFile['sha'] ?? null;
+
+            # Remote file changed since the last sync -> do not delete someone else's work
+            # (on force pushes the local deletion wins)
+            if (!$force && $storedSha && $currentSha && $storedSha !== $currentSha)
+            {
+                $conflicts[] = $trackedPath;
+                continue;
+            }
+
+            $orphanDeletions[$trackedPath] = $currentSha;
+        }
+
+        if (!empty($conflicts) && !$force)
+        {
+            $pluginData = $this->addHistoryEntry($pluginData, [
+                'action'        => $actionName,
+                'connection_id' => $connectionId,
+                'status'        => 'error',
+                'files'         => 0,
+                'message'       => 'Push aborted. Remote file(s) have changed. Please pull the latest version first. Conflicts: ' . implode(', ', $conflicts)
+            ]);
+            return [
+                'success'       => false,
+                'status_code'   => 409,
+                'message'       => 'Push aborted. Remote file(s) have changed. Please pull the latest version first.',
+                'pluginData'    => $pluginData,
+                'files'         => 0,
+                'skipped'       => 0,
+                'conflicts'     => $conflicts,
+                'detail'        => '',
+                'history'       => $pluginData['history'] ?? []
+            ];
+        }
 
         foreach ($localFiles as $relativePath)
         {
@@ -840,6 +984,12 @@ class Gitsync extends Plugin
 
             # Apply file pattern filter
             if (!$this->matchesPattern($remotePath, $filePattern))
+            {
+                continue;
+            }
+
+            # Skip files inside excluded local folders
+            if ($this->isExcludedLocalPath($relativePath, $excludeFolders))
             {
                 continue;
             }
@@ -871,14 +1021,14 @@ class Gitsync extends Plugin
             else
             {
                 $error = $client->getLastError();
-                if (stripos($error, 'Not Found') !== false)
+                if (stripos($error ?? '', 'Not Found') !== false)
                 {
                     $remoteExists = false;
                 }
                 else
                 {
                     $pluginData = $this->addHistoryEntry($pluginData, [
-                        'action'        => 'push',
+                        'action'        => $actionName,
                         'connection_id' => $connectionId,
                         'status'        => 'error',
                         'files'         => 0,
@@ -899,7 +1049,8 @@ class Gitsync extends Plugin
             }
 
             # Conflict check: if remote exists and SHA differs from our stored SHA
-            if ($remoteExists && isset($files[$remotePath]['remote_sha']) && $files[$remotePath]['remote_sha'] !== $remoteSha)
+            # (on force pushes the local version wins and overwrites the remote file)
+            if (!$force && $remoteExists && isset($files[$remotePath]['remote_sha']) && $files[$remotePath]['remote_sha'] !== $remoteSha)
             {
                 $conflicts[] = $remotePath;
                 continue;
@@ -911,7 +1062,7 @@ class Gitsync extends Plugin
             if ($result === false)
             {
                 $pluginData = $this->addHistoryEntry($pluginData, [
-                    'action'        => 'push',
+                    'action'        => $actionName,
                     'connection_id' => $connectionId,
                     'status'        => 'error',
                     'files'         => 0,
@@ -943,10 +1094,10 @@ class Gitsync extends Plugin
             $filesPushed++;
         }
 
-        if (!empty($conflicts))
+        if (!empty($conflicts) && !$force)
         {
             $pluginData = $this->addHistoryEntry($pluginData, [
-                'action'        => 'push',
+                'action'        => $actionName,
                 'connection_id' => $connectionId,
                 'status'        => 'error',
                 'files'         => 0,
@@ -963,6 +1114,41 @@ class Gitsync extends Plugin
                 'detail'        => '',
                 'history'       => $pluginData['history'] ?? []
             ];
+        }
+
+        # Delete orphaned remote files (local renames, moves and deletions)
+        $filesDeleted = 0;
+        foreach ($orphanDeletions as $orphanPath => $orphanSha)
+        {
+            $deleteResult = $client->deleteFile($orphanPath, $defaultMessage, $orphanSha);
+            if ($deleteResult === false)
+            {
+                $pluginData = $this->addHistoryEntry($pluginData, [
+                    'action'        => $actionName,
+                    'connection_id' => $connectionId,
+                    'status'        => 'error',
+                    'files'         => $filesPushed,
+                    'message'       => 'Failed to delete ' . $orphanPath . ': ' . $client->getLastError()
+                ]);
+                return [
+                    'success'       => false,
+                    'status_code'   => 500,
+                    'message'       => 'Failed to delete ' . $orphanPath . ': ' . $client->getLastError(),
+                    'pluginData'    => $pluginData,
+                    'files'         => $filesPushed,
+                    'skipped'       => $filesSkipped,
+                    'conflicts'     => [],
+                    'detail'        => '',
+                    'history'       => $pluginData['history'] ?? []
+                ];
+            }
+
+            unset($updatedFiles[$orphanPath]);
+            if (!empty($deleteResult['commit_sha']))
+            {
+                $lastCommitSha = $deleteResult['commit_sha'];
+            }
+            $filesDeleted++;
         }
 
         # Update connection data
@@ -987,7 +1173,7 @@ class Gitsync extends Plugin
                 else
                 {
                     $pluginData = $this->addHistoryEntry($pluginData, [
-                        'action'        => 'push',
+                        'action'        => $actionName,
                         'connection_id' => $connectionId,
                         'status'        => 'warning',
                         'files'         => $filesPushed,
@@ -997,14 +1183,18 @@ class Gitsync extends Plugin
             }
         }
 
-        $detail = 'Pushed ' . $filesPushed . ' file' . ($filesPushed !== 1 ? 's' : '') . ' to remote';
+        $detail = ($force ? 'Forced push: pushed ' : 'Pushed ') . $filesPushed . ' file' . ($filesPushed !== 1 ? 's' : '') . ' to remote';
+        if ($filesDeleted > 0)
+        {
+            $detail .= ', deleted ' . $filesDeleted . ' orphaned';
+        }
         if ($filesSkipped > 0)
         {
             $detail .= ', skipped ' . $filesSkipped . ' unchanged';
         }
 
         $pluginData = $this->addHistoryEntry($pluginData, [
-            'action'        => 'push',
+            'action'        => $actionName,
             'connection_id' => $connectionId,
             'status'        => 'success',
             'files'         => $filesPushed,
@@ -1017,10 +1207,321 @@ class Gitsync extends Plugin
             'message'       => 'Push completed',
             'pluginData'    => $pluginData,
             'files'         => $filesPushed,
+            'deleted'       => $filesDeleted,
             'skipped'       => $filesSkipped,
             'conflicts'     => [],
             'detail'        => $detail,
             'history'       => $pluginData['history'] ?? []
+        ];
+    }
+
+    /* ================================================================
+       RESOLVE
+       ================================================================ */
+
+    public function resolveConnection(Request $request, Response $response, $args)
+    {
+        ini_set('memory_limit', '256M');
+
+        $connectionId = $args['id'] ?? false;
+
+        $pluginData = $this->getPluginYamlData('gitsync.yaml');
+        if (!is_array($pluginData))
+        {
+            $pluginData = [];
+        }
+        $connections = $pluginData['connections'] ?? [];
+
+        if (!$connectionId)
+        {
+            return $this->errorResponse($response, 'Connection ID required', 400, $pluginData);
+        }
+
+        if (!isset($connections[$connectionId]))
+        {
+            return $this->errorResponse($response, 'Connection not found', 404, $pluginData);
+        }
+
+        $connection = $connections[$connectionId];
+        $params = $request->getParsedBody() ?? [];
+        $decisions = $params['decisions'] ?? [];
+
+        if (!is_array($decisions) || empty($decisions))
+        {
+            return $this->errorResponse($response, 'No decisions provided. Send decisions as {"decisions": {"path": "local"|"remote"}}.', 400, $pluginData);
+        }
+
+        foreach ($decisions as $path => $decision)
+        {
+            if (!is_string($path) || ($decision !== 'local' && $decision !== 'remote'))
+            {
+                return $this->errorResponse($response, 'Invalid decision for ' . $path . '. Use "local" or "remote".', 400, $pluginData);
+            }
+        }
+
+        if (!$this->getGitToken())
+        {
+            return $this->errorResponse($response, 'Git token not configured', 400, $pluginData);
+        }
+
+        # Recompute the authoritative conflict list
+        $status = $this->getRepositoryStatus($connection);
+        if ($status === false)
+        {
+            return $this->errorResponse($response, 'Failed to compute status: ' . ($this->statusError ?? 'unknown error'), 500, $pluginData);
+        }
+
+        $conflictPaths = [];
+        foreach ($status['files'] as $file)
+        {
+            if ($file['status'] === 'conflict')
+            {
+                $conflictPaths[$file['path']] = true;
+            }
+        }
+
+        if (empty($conflictPaths))
+        {
+            return $this->errorResponse($response, 'No conflicts to resolve for this connection', 200, $pluginData);
+        }
+
+        # Only accept decisions for files that are actually conflicting
+        $validDecisions = [];
+        $skippedPaths = [];
+        foreach ($decisions as $path => $decision)
+        {
+            if (isset($conflictPaths[$path]))
+            {
+                $validDecisions[$path] = $decision;
+            }
+            else
+            {
+                $skippedPaths[] = $path;
+            }
+        }
+
+        if (empty($validDecisions))
+        {
+            return $this->errorResponse($response, 'None of the given files is in conflict state', 400, $pluginData);
+        }
+
+        $result = $this->performResolve($connectionId, $connection, $pluginData, $validDecisions, $skippedPaths);
+
+        $pluginData = $result['pluginData'];
+        $this->storePluginYamlData('gitsync.yaml', $pluginData);
+
+        if ($result['written_locally'])
+        {
+            $this->clearNavigationCache();
+        }
+
+        if ($result['success'])
+        {
+            $response->getBody()->write(json_encode([
+                'message'   => $result['message'],
+                'resolved'  => $result['resolved'],
+                'detail'    => $result['detail'],
+                'history'   => $result['history']
+            ]));
+
+            return $response->withHeader('Content-Type', 'application/json');
+        }
+
+        return $this->errorResponse($response, $result['message'], $result['status_code'], $pluginData);
+    }
+
+    /**
+     * Internal conflict resolution: apply a keep-local or keep-remote decision
+     * per conflicting file and update the tracking data.
+     *
+     * "Keep remote" pulls the remote version over the local file (or deletes
+     * the local file if it was deleted remotely). "Keep local" pushes the
+     * local version over the remote file (or deletes the remote file if it
+     * was deleted locally). Only conflicting files inside the sync scope are
+     * touched; everything else is left for a normal pull or push.
+     *
+     * @return array Result with keys: success, status_code, message, pluginData,
+     *               resolved, detail, history, written_locally.
+     */
+    private function performResolve(string $connectionId, array $connection, array $pluginData, array $decisions, array $skippedPaths = []): array
+    {
+        $actionName = 'resolve';
+        $localFolder = $connection['local_folder'];
+        $repoPath = $connection['repo_path'] ?? '';
+        $filePattern = $connection['file_pattern'] ?? '';
+        $excludeFolders = $this->parseExcludeFolders($connection['exclude_folders'] ?? '');
+
+        $apikey = $this->getGitToken();
+        if (!$apikey)
+        {
+            $pluginData = $this->addHistoryEntry($pluginData, [
+                'action'        => $actionName,
+                'connection_id' => $connectionId,
+                'status'        => 'error',
+                'files'         => 0,
+                'message'       => 'Token not configured'
+            ]);
+            return [
+                'success'        => false,
+                'status_code'    => 400,
+                'message'        => 'Git token not configured',
+                'pluginData'     => $pluginData,
+                'resolved'       => 0,
+                'detail'         => '',
+                'history'        => $pluginData['history'] ?? [],
+                'written_locally' => false
+            ];
+        }
+
+        $client = $this->createClient($connection, $apikey, $this->getTimeout());
+
+        $files = $connection['files'] ?? [];
+        $keptLocal = 0;
+        $keptRemote = 0;
+        $writtenLocally = false;
+        $errorMessage = null;
+
+        foreach ($decisions as $path => $decision)
+        {
+            # Scope guard: never touch files outside repo_path / file_pattern / exclude_folders
+            if (!$this->shouldSyncFile($path, $repoPath, $filePattern, $excludeFolders))
+            {
+                $skippedPaths[] = $path;
+                continue;
+            }
+
+            $localPath = $this->localPathFromRepoPath($repoPath, $path);
+
+            if ($decision === 'remote')
+            {
+                # Remote wins: fetch the remote version and overwrite the local file
+                $remoteFile = $client->getFile($path);
+                if ($remoteFile === false)
+                {
+                    $error = $client->getLastError();
+                    if (stripos($error ?? '', 'Not Found') !== false)
+                    {
+                        # The remote file is gone -> keeping remote means deleting the local file
+                        $this->deleteContentFile($localFolder, $localPath);
+                        unset($files[$path]);
+                        $keptRemote++;
+                        continue;
+                    }
+                    $errorMessage = 'Failed to fetch ' . $path . ': ' . $error;
+                    break;
+                }
+
+                $this->writeContentFile($localFolder, $localPath, $remoteFile['content']);
+                $writtenLocally = true;
+                $files[$path] = [
+                    'remote_sha' => $remoteFile['sha'],
+                    'local_hash' => sha1($remoteFile['content'])
+                ];
+                $keptRemote++;
+            }
+            else
+            {
+                # Local wins: push the local version over the remote file
+                $localContent = $this->readContentFile($localFolder, $localPath);
+
+                if ($localContent === false)
+                {
+                    # The local file is gone -> keeping local means deleting the remote file
+                    $deleteResult = $client->deleteFile($path, 'Resolved from Typemill');
+                    if ($deleteResult === false)
+                    {
+                        $errorMessage = 'Failed to delete ' . $path . ' remotely: ' . $client->getLastError();
+                        break;
+                    }
+                    unset($files[$path]);
+                    $keptLocal++;
+                    continue;
+                }
+
+                # Fetch the current remote sha so the local version can overwrite it
+                $remoteFile = $client->getFile($path);
+                $remoteSha = null;
+                if ($remoteFile !== false)
+                {
+                    $remoteSha = $remoteFile['sha'];
+                }
+                else
+                {
+                    $error = $client->getLastError();
+                    if (stripos($error ?? '', 'Not Found') === false)
+                    {
+                        $errorMessage = 'Failed to fetch ' . $path . ': ' . $error;
+                        break;
+                    }
+                    # Remote file is gone -> pushing without a sha recreates it
+                }
+
+                $result = $client->updateFile($path, $localContent, 'Resolved from Typemill', $remoteSha);
+                if ($result === false)
+                {
+                    $errorMessage = 'Failed to push ' . $path . ': ' . $client->getLastError();
+                    break;
+                }
+
+                $files[$path] = [
+                    'remote_sha' => $result['sha'] ?? $remoteSha,
+                    'local_hash' => sha1($localContent)
+                ];
+                $keptLocal++;
+            }
+        }
+
+        # Persist the tracking updates even when an API error aborted the loop
+        if (isset($pluginData['connections'][$connectionId]))
+        {
+            $pluginData['connections'][$connectionId]['files'] = $files;
+        }
+
+        if ($errorMessage !== null)
+        {
+            $pluginData = $this->addHistoryEntry($pluginData, [
+                'action'        => $actionName,
+                'connection_id' => $connectionId,
+                'status'        => 'error',
+                'files'         => $keptLocal + $keptRemote,
+                'message'       => $errorMessage
+            ]);
+            return [
+                'success'        => false,
+                'status_code'    => 500,
+                'message'        => $errorMessage,
+                'pluginData'     => $pluginData,
+                'resolved'       => $keptLocal + $keptRemote,
+                'detail'         => '',
+                'history'        => $pluginData['history'] ?? [],
+                'written_locally' => $writtenLocally
+            ];
+        }
+
+        $resolved = $keptLocal + $keptRemote;
+        $detail = 'Resolved ' . $resolved . ' conflict' . ($resolved !== 1 ? 's' : '') . ': ' . $keptLocal . ' kept the Typemill version, ' . $keptRemote . ' kept the Git version';
+        if (!empty($skippedPaths))
+        {
+            $detail .= ', skipped ' . count($skippedPaths) . ' out of sync scope';
+        }
+
+        $pluginData = $this->addHistoryEntry($pluginData, [
+            'action'        => $actionName,
+            'connection_id' => $connectionId,
+            'status'        => 'success',
+            'files'         => $resolved,
+            'message'       => $detail
+        ]);
+
+        return [
+            'success'        => true,
+            'status_code'    => 200,
+            'message'        => 'Conflicts resolved',
+            'pluginData'     => $pluginData,
+            'resolved'       => $resolved,
+            'detail'         => $detail,
+            'history'        => $pluginData['history'] ?? [],
+            'written_locally' => $writtenLocally
         ];
     }
 
@@ -1145,6 +1646,47 @@ class Gitsync extends Plugin
         return $this->storage;
     }
 
+    /**
+     * Read the configured Git personal access token from the secrets storage.
+     */
+    protected function getGitToken(): string
+    {
+        $settingsModel = new Settings();
+        $token = $settingsModel->getSecret('github_token', 'plugins', 'gitsync');
+
+        return is_string($token) ? $token : '';
+    }
+
+    /**
+     * Read the configured API timeout from the plugin settings.
+     */
+    protected function getTimeout(): int
+    {
+        $pluginSettings = $this->getPluginSettings();
+        $timeout = isset($pluginSettings['timeout']) ? (int) $pluginSettings['timeout'] : 60;
+        if ($timeout < 5)
+        {
+            $timeout = 5;
+        }
+        return $timeout;
+    }
+
+    /**
+     * Create the Git platform client for a connection.
+     */
+    protected function createClient(array $connection, string $apikey, int $timeout): GitPlatformClient
+    {
+        return GitPlatformClient::factory([
+            'platform'      => $connection['platform'] ?? 'github',
+            'owner'         => $connection['owner'],
+            'repo'          => $connection['repo'],
+            'branch'        => $connection['branch'] ?? 'main',
+            'token'         => $apikey,
+            'timeout'       => $timeout,
+            'api_base_url'  => $connection['api_base_url'] ?? ''
+        ]);
+    }
+
     private function isSyncableFile($filename)
     {
         return preg_match('/\.(md|markdown)$/i', $filename);
@@ -1189,6 +1731,70 @@ class Gitsync extends Plugin
         return $path;
     }
 
+    /**
+     * Normalize the exclude_folders input (a comma separated string or an array)
+     * into a clean list of folder paths relative to the sync root.
+     *
+     * Strict mode (API input) returns false if any entry is invalid, so the
+     * request can be rejected. Lenient mode (stored data) drops invalid entries.
+     */
+    private function parseExcludeFolders($input, bool $strict = false)
+    {
+        if (is_array($input))
+        {
+            $entries = $input;
+        }
+        elseif (is_string($input))
+        {
+            $entries = explode(',', $input);
+        }
+        else
+        {
+            return $strict ? false : [];
+        }
+
+        $folders = [];
+        foreach ($entries as $entry)
+        {
+            $entry = trim($entry, " \t\n\r\0\x0B/\\");
+            if ($entry === '')
+            {
+                continue;
+            }
+
+            # Reject path traversal and anything but plain folder names
+            if (str_contains($entry, '..') || !preg_match('/^[a-zA-Z0-9_\-\/]+$/', $entry))
+            {
+                if ($strict)
+                {
+                    return false;
+                }
+                continue;
+            }
+
+            $folders[] = $entry;
+        }
+
+        return array_values(array_unique($folders));
+    }
+
+    /**
+     * Check if a local path (relative to the sync root) is inside one of the
+     * excluded folders. A path that equals an entry is excluded as well, so
+     * single files can be excluded too.
+     */
+    private function isExcludedLocalPath(string $localPath, array $excludeFolders): bool
+    {
+        foreach ($excludeFolders as $excludeFolder)
+        {
+            if ($localPath === $excludeFolder || str_starts_with($localPath, $excludeFolder . '/'))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private function matchesPattern($filename, $pattern)
     {
         if (empty($pattern))
@@ -1198,7 +1804,7 @@ class Gitsync extends Plugin
         return fnmatch($pattern, $filename, FNM_CASEFOLD);
     }
 
-    private function shouldSyncFile($filename, $repoPath, $filePattern)
+    private function shouldSyncFile($filename, $repoPath, $filePattern, array $excludeFolders = [])
     {
         # If repo_path is set, file must be under that path
         if (!empty($repoPath))
@@ -1207,6 +1813,11 @@ class Gitsync extends Plugin
             {
                 return false;
             }
+        }
+        # Skip files inside excluded local folders
+        if ($this->isExcludedLocalPath($this->localPathFromRepoPath($repoPath, $filename), $excludeFolders))
+        {
+            return false;
         }
         # Apply file pattern filter
         return $this->matchesPattern($filename, $filePattern);
@@ -1264,6 +1875,14 @@ class Gitsync extends Plugin
         if ($result !== true)
         {
             error_log('GitSync deleteContentFile failed: ' . $storage->getError());
+        }
+
+        # Also remove the sidecar files (.yaml meta, .txt draft), like Content::deletePage()
+        $baseName = preg_replace('/\.(md|markdown)$/i', '', $filename);
+        if ($baseName !== $filename)
+        {
+            $storage->deleteFile('contentFolder', $subFolder, $baseName . '.yaml');
+            $storage->deleteFile('contentFolder', $subFolder, $baseName . '.txt');
         }
 
         return $result;
@@ -1334,16 +1953,12 @@ class Gitsync extends Plugin
         $localFolder = $connection['local_folder'] ?? '';
         $repoPath = $connection['repo_path'] ?? '';
         $filePattern = $connection['file_pattern'] ?? '';
+        $excludeFolders = $this->parseExcludeFolders($connection['exclude_folders'] ?? '');
 
         $files = $connection['files'] ?? [];
         $lastSyncSha = $connection['last_sync_sha'] ?? null;
 
-        $pluginSettings = $this->getPluginSettings();
-        $timeout = isset($pluginSettings['timeout']) ? (int) $pluginSettings['timeout'] : 60;
-        if ($timeout < 5) { $timeout = 5; }
-
-        $settingsModel = new Settings();
-        $apikey = $settingsModel->getSecret('github_token', 'plugins', 'gitsync');
+        $apikey = $this->getGitToken();
 
         if (!$apikey)
         {
@@ -1351,15 +1966,7 @@ class Gitsync extends Plugin
             return false;
         }
 
-        $client = GitPlatformClient::factory([
-            'platform'      => $connection['platform'] ?? 'github',
-            'owner'         => $connection['owner'],
-            'repo'          => $connection['repo'],
-            'branch'        => $connection['branch'] ?? 'main',
-            'token'         => $apikey,
-            'timeout'       => $timeout,
-            'api_base_url'  => $connection['api_base_url'] ?? ''
-        ]);
+        $client = $this->createClient($connection, $apikey, $this->getTimeout());
 
         $latestRemoteSha = $client->getLatestCommitSha();
         if (!$latestRemoteSha)
@@ -1372,12 +1979,22 @@ class Gitsync extends Plugin
         $allFiles = [];
         foreach (array_keys($files) as $path)
         {
+            # Skip tracked files inside excluded local folders
+            if ($this->isExcludedLocalPath($this->localPathFromRepoPath($repoPath, $path), $excludeFolders))
+            {
+                continue;
+            }
             $allFiles[$path] = true;
         }
 
         $localFiles = $this->scanLocalMdFiles($localFolder);
         foreach ($localFiles as $relativePath)
         {
+            # Skip files inside excluded local folders
+            if ($this->isExcludedLocalPath($relativePath, $excludeFolders))
+            {
+                continue;
+            }
             $repoFilePath = $this->repoFilePathFromLocalPath($repoPath, $relativePath);
             if ($this->matchesPattern($repoFilePath, $filePattern))
             {
@@ -1394,8 +2011,8 @@ class Gitsync extends Plugin
 
             if ($localContent === false)
             {
-                # File does not exist locally
-                $localChanged[$path] = false;
+                # Tracked file no longer exists locally -> pending push deletion
+                $localChanged[$path] = true;
                 continue;
             }
 
@@ -1427,7 +2044,7 @@ class Gitsync extends Plugin
             foreach ($changedFiles as $file)
             {
                 $filename = $file['filename'];
-                if ($this->shouldSyncFile($filename, $repoPath, $filePattern))
+                if ($this->shouldSyncFile($filename, $repoPath, $filePattern, $excludeFolders))
                 {
                     $remoteChanged[$filename] = true;
                     $allFiles[$filename] = true;
@@ -1438,10 +2055,10 @@ class Gitsync extends Plugin
         # Build status table
         $statusList = [];
         $counts = [
-            'sync'      => 0,
-            'push'      => 0,
-            'pull'      => 0,
-            'conflicts' => 0
+            'sync'     => 0,
+            'push'     => 0,
+            'pull'     => 0,
+            'conflict' => 0
         ];
 
         foreach (array_keys($allFiles) as $path)
@@ -1481,7 +2098,7 @@ class Gitsync extends Plugin
             'sync' => $counts['sync'],
             'push' => $counts['push'],
             'pull' => $counts['pull'],
-            'conflicts' => $counts['conflicts'],
+            'conflicts' => $counts['conflict'],
             'files' => $statusList
         ];
     }

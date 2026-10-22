@@ -70,7 +70,8 @@ const app = Vue.createApp({
 									</span>
 								</div>
 								<div v-if="connStatus(conn.id).conflicts > 0" class="text-xs text-rose-600 mt-1">
-									Resolve conflicts manually before pushing or pulling.
+									{{ connStatus(conn.id).conflicts }} conflicting file{{ connStatus(conn.id).conflicts === 1 ? '' : 's' }} (changed in Typemill and in the Git repository).
+									<button class="underline font-medium hover:text-rose-800 transition" @click.prevent="openResolve(conn.id)">Resolve now</button>
 								</div>
 							</div>
 						</div>
@@ -136,6 +137,111 @@ const app = Vue.createApp({
 								@click.prevent="toggleHistory(conn.id)">
 								<svg class="icon icon-close text-sm"><use xlink:href="#icon-close"></use></svg>
 							</button>
+						</div>
+
+						<!-- Conflict resolution -->
+						<div v-if="connStatus(conn.id).conflicts > 0" class="border border-rose-200 bg-white rounded mb-4 p-4">
+
+							<!-- Stage: selection -->
+							<div v-if="!resolveConfirm[conn.id]">
+								<div class="flex justify-between items-center flex-wrap gap-2 mb-3">
+									<div class="text-sm font-medium text-rose-700 flex items-center gap-2">
+										Resolve conflicts
+									</div>
+									<div class="flex items-center gap-4 text-xs text-stone-600">
+										<label class="flex items-center gap-1 cursor-pointer">
+											<input type="radio" :name="'bulk-' + conn.id" :checked="allDecisionsFor(conn.id, 'local')" @change="setAllDecisions(conn.id, 'local')">
+											All Typemill version
+										</label>
+										<label class="flex items-center gap-1 cursor-pointer">
+											<input type="radio" :name="'bulk-' + conn.id" :checked="allDecisionsFor(conn.id, 'remote')" @change="setAllDecisions(conn.id, 'remote')">
+											All Git version
+										</label>
+									</div>
+								</div>
+
+								<p class="text-xs text-stone-500 mb-3">
+									These files changed in Typemill <strong>and</strong> in the Git repository since the last sync.
+									Choose the version to keep per file. "Keep Typemill version" overwrites the Git repository,
+									"Keep Git version" overwrites the Typemill file.
+								</p>
+
+								<div class="border border-stone-200 overflow-hidden rounded mb-4">
+									<div class="overflow-x-auto">
+										<table class="w-full text-xs">
+											<thead class="bg-stone-100 text-stone-600">
+												<tr>
+													<th class="p-2 text-left font-medium">File</th>
+													<th class="p-2 text-left font-medium whitespace-nowrap">Keep Typemill version</th>
+													<th class="p-2 text-left font-medium whitespace-nowrap">Keep Git version</th>
+												</tr>
+											</thead>
+											<tbody class="divide-y divide-stone-200">
+												<tr v-for="file in conflictFiles(conn.id)" :key="file.path">
+													<td class="p-2 font-mono text-stone-600">{{ file.path }}</td>
+													<td class="p-2 whitespace-nowrap"><input type="radio" :name="'keep-' + conn.id + '-' + file.path" value="local" v-model="resolveDecisions[conn.id][file.path]"></td>
+													<td class="p-2 whitespace-nowrap"><input type="radio" :name="'keep-' + conn.id + '-' + file.path" value="remote" v-model="resolveDecisions[conn.id][file.path]"></td>
+												</tr>
+											</tbody>
+										</table>
+									</div>
+								</div>
+
+								<div class="flex flex-wrap justify-end gap-2">
+									<button type="button" class="px-3 py-2 text-sm text-white bg-stone-700 hover:bg-stone-900 transition disabled:cursor-not-allowed" :disabled="!allDecisionsMade(conn.id) || resolveBusy[conn.id]" @click.prevent="confirmResolveAction(conn.id, 'resolve')">
+										Resolve selection
+									</button>
+									<button type="button" class="px-3 py-2 text-sm text-white bg-rose-500 hover:bg-rose-700 transition disabled:cursor-not-allowed" :disabled="resolveBusy[conn.id]" @click.prevent="confirmResolveAction(conn.id, 'force-pull')">
+										Force pull — Git version wins
+									</button>
+									<button type="button" class="px-3 py-2 text-sm text-white bg-rose-500 hover:bg-rose-700 transition disabled:cursor-not-allowed" :disabled="resolveBusy[conn.id]" @click.prevent="confirmResolveAction(conn.id, 'force-push')">
+										Force push — Typemill version wins
+									</button>
+								</div>
+
+								<p class="text-xs text-stone-400 mt-3">
+									Force pull/push apply your choice to all conflicting files and then sync all other changes normally.
+									After resolving the selection, run a normal pull or push for remaining changes.
+								</p>
+							</div>
+
+							<!-- Stage: confirmation -->
+							<div v-if="resolveConfirm[conn.id]">
+								<div class="text-sm font-medium text-rose-700 mb-2">
+									{{ resolveConfirm[conn.id] === 'resolve' ? 'Confirm resolution' : (resolveConfirm[conn.id] === 'force-pull' ? 'Confirm force pull' : 'Confirm force push') }}
+								</div>
+
+								<div v-if="resolveConfirm[conn.id] === 'resolve'" class="text-sm text-stone-700 mb-4">
+									<div v-if="decisionPathsFor(conn.id, 'local').length > 0">
+										<strong>Keep Typemill version</strong> (overwrites the Git repository):
+										<span class="font-mono text-xs">{{ decisionPathsFor(conn.id, 'local').join(', ') }}</span>
+									</div>
+									<div v-if="decisionPathsFor(conn.id, 'remote').length > 0" class="mt-2">
+										<strong>Keep Git version</strong> (overwrites the Typemill file):
+										<span class="font-mono text-xs">{{ decisionPathsFor(conn.id, 'remote').join(', ') }}</span>
+									</div>
+								</div>
+
+								<div v-else-if="resolveConfirm[conn.id] === 'force-pull'" class="text-sm text-stone-700 mb-4">
+									Force pull keeps the <strong>Git version</strong> for all conflicting files. Your Typemill changes to these files are lost:
+									<div class="font-mono text-xs mt-1">{{ conflictPathsList(conn.id).join(', ') }}</div>
+									All other remote changes are pulled normally afterwards. This cannot be undone.
+								</div>
+
+								<div v-else class="text-sm text-stone-700 mb-4">
+									Force push keeps the <strong>Typemill version</strong> for all conflicting files. Git changes to these files are lost:
+									<div class="font-mono text-xs mt-1">{{ conflictPathsList(conn.id).join(', ') }}</div>
+									All other local changes are pushed normally afterwards. This cannot be undone.
+								</div>
+
+								<div class="flex justify-end gap-3">
+									<button type="button" class="px-4 p-3 bg-stone-200 hover:bg-stone-300 transition" @click.prevent="backToResolveSelect(conn.id)" :disabled="resolveBusy[conn.id]">Back</button>
+									<button type="button" class="px-4 p-3 text-white bg-rose-500 hover:bg-rose-700 transition disabled:cursor-not-allowed" :disabled="resolveBusy[conn.id]" @click.prevent="executeResolveAction(conn.id)">
+										{{ resolveBusy[conn.id] ? 'Working...' : (resolveConfirm[conn.id] === 'resolve' ? 'Resolve now' : (resolveConfirm[conn.id] === 'force-pull' ? 'Force pull now' : 'Force push now')) }}
+									</button>
+								</div>
+							</div>
+
 						</div>
 
 						<!-- Unsynced file list -->
@@ -325,6 +431,9 @@ const app = Vue.createApp({
 			editingConnection: null,
 			showDeleteModal: false,
 			deleteTargetId: null,
+			resolveDecisions: {},
+			resolveConfirm: {},
+			resolveBusy: {},
 			formDefinitions: data.plugin && data.plugin.connection_form ? data.plugin.connection_form.fields : {},
 			formData: {},
 			message: '',
@@ -383,6 +492,7 @@ const app = Vue.createApp({
 							repo: c.repo,
 							branch: c.branch || 'main',
 							local_folder: c.local_folder || '',
+						exclude_folders: c.exclude_folders || '',
 							platform: c.platform || 'github',
 							api_base_url: c.api_base_url || '',
 							repo_path: c.repo_path || '',
@@ -531,6 +641,8 @@ const app = Vue.createApp({
 			tmaxios.get('/api/v1/gitsync/status/' + connectionId)
 				.then(function(response) {
 					self.connectionStatus[connectionId] = response.data;
+					// preselect the Typemill version for newly detected conflicts
+					self.ensureDecisions(connectionId);
 				})
 				.catch(function() {
 					self.connectionStatus[connectionId] = {
@@ -574,6 +686,7 @@ const app = Vue.createApp({
 					repo: conn.repo,
 					branch: conn.branch || 'main',
 					local_folder: conn.local_folder,
+					exclude_folders: conn.exclude_folders || '',
 					platform: conn.platform || 'github',
 					api_base_url: conn.api_base_url || '',
 					repo_path: conn.repo_path || '',
@@ -612,6 +725,7 @@ const app = Vue.createApp({
 				repo: this.formData.repo,
 				branch: this.formData.branch,
 				local_folder: this.formData.local_folder || '',
+				exclude_folders: this.formData.exclude_folders || '',
 				platform: this.formData.platform || 'github',
 				api_base_url: this.formData.api_base_url || '',
 				repo_path: this.formData.repo_path || '',
@@ -695,6 +809,116 @@ const app = Vue.createApp({
 				});
 		},
 
+		conflictFiles(connectionId) {
+			var status = this.connStatus(connectionId);
+			if (!status || !status.files) return [];
+			return status.files.filter(function(file) {
+				return file.status === 'conflict';
+			});
+		},
+
+		conflictPathsList(connectionId) {
+			return this.conflictFiles(connectionId).map(function(file) {
+				return file.path;
+			});
+		},
+
+		openResolve(connectionId) {
+			// same toggle logic as the history panel: expand the status view
+			if (!this.historyVisible[connectionId]) {
+				this.historyVisible[connectionId] = true;
+				this.fetchHistoryForConnection(connectionId);
+				this.fetchStatus(connectionId);
+			}
+			this.resolveConfirm[connectionId] = null;
+		},
+
+		ensureDecisions(connectionId) {
+			var current = this.resolveDecisions[connectionId] || {};
+			var fresh = {};
+			this.conflictFiles(connectionId).forEach(function(file) {
+				// keep an existing valid decision, default to the Typemill version
+				fresh[file.path] = (current[file.path] === 'local' || current[file.path] === 'remote') ? current[file.path] : 'local';
+			});
+			this.resolveDecisions[connectionId] = fresh;
+		},
+
+		setAllDecisions(connectionId, side) {
+			var fresh = {};
+			this.conflictFiles(connectionId).forEach(function(file) {
+				fresh[file.path] = side;
+			});
+			this.resolveDecisions[connectionId] = fresh;
+		},
+
+		allDecisionsFor(connectionId, side) {
+			var decisions = this.resolveDecisions[connectionId];
+			var files = this.conflictFiles(connectionId);
+			if (!decisions || files.length === 0) return false;
+			return files.every(function(file) {
+				return decisions[file.path] === side;
+			});
+		},
+
+		decisionPathsFor(connectionId, side) {
+			var decisions = this.resolveDecisions[connectionId] || {};
+			return Object.keys(decisions).filter(function(path) {
+				return decisions[path] === side;
+			});
+		},
+
+		allDecisionsMade(connectionId) {
+			var decisions = this.resolveDecisions[connectionId];
+			var files = this.conflictFiles(connectionId);
+			if (!decisions || files.length === 0) return false;
+			return files.every(function(file) {
+				return decisions[file.path] === 'local' || decisions[file.path] === 'remote';
+			});
+		},
+
+		confirmResolveAction(connectionId, action) {
+			this.resolveConfirm[connectionId] = action;
+		},
+
+		backToResolveSelect(connectionId) {
+			this.resolveConfirm[connectionId] = null;
+		},
+
+		executeResolveAction(connectionId) {
+			var self = this;
+			var action = this.resolveConfirm[connectionId];
+			this.resolveBusy[connectionId] = true;
+
+			var request;
+			if (action === 'resolve') {
+				request = tmaxios.post('/api/v1/gitsync/resolve/' + connectionId, { decisions: this.resolveDecisions[connectionId] });
+			} else if (action === 'force-pull') {
+				request = tmaxios.post('/api/v1/gitsync/pull/' + connectionId, { force: true });
+			} else {
+				request = tmaxios.post('/api/v1/gitsync/push/' + connectionId, { force: true });
+			}
+
+			request.then(function(response) {
+				self.resolveBusy[connectionId] = false;
+				self.resolveConfirm[connectionId] = null;
+				self.syncMessage = response.data.detail || response.data.message || 'Conflicts resolved';
+				self.syncMessageClass = 'bg-teal-500';
+				self.fetchHistoryForConnection(connectionId);
+				self.fetchStatus(connectionId);
+			}).catch(function(error) {
+				if (error.response) {
+					self.resolveBusy[connectionId] = false;
+					self.resolveConfirm[connectionId] = null;
+					self.syncMessage = error.response.data.message || 'Resolve failed';
+					self.syncMessageClass = 'bg-rose-500';
+					self.fetchHistoryForConnection(connectionId);
+					self.fetchStatus(connectionId);
+				} else {
+					self.resolveBusy[connectionId] = false;
+				}
+			});
+		},
+
 		pushNow(connectionId) {
 			var self = this;
 			this.loading = true;
@@ -715,10 +939,19 @@ const app = Vue.createApp({
 					self.loading = false;
 					self.activeSync[connectionId] = null;
 					if (error.response) {
-						self.syncMessage = error.response.data.message || 'Push failed';
+						var msg = error.response.data.message || 'Push failed';
+						if (error.response.data.conflicts && error.response.data.conflicts.length > 0) {
+							msg += ' Affected files: ' + error.response.data.conflicts.join(', ');
+						}
+						self.syncMessage = msg;
 						self.syncMessageClass = 'bg-rose-500';
 						self.fetchHistoryForConnection(connectionId);
-						self.fetchStatus(connectionId);
+						if (error.response.data.conflicts && error.response.data.conflicts.length > 0) {
+							// expand the status view with the resolve section
+							self.openResolve(connectionId);
+						} else {
+							self.fetchStatus(connectionId);
+						}
 					}
 				});
 		},
@@ -743,10 +976,19 @@ const app = Vue.createApp({
 					self.loading = false;
 					self.activeSync[connectionId] = null;
 					if (error.response) {
-						self.syncMessage = error.response.data.message || 'Pull failed';
+						var msg = error.response.data.message || 'Pull failed';
+						if (error.response.data.conflicts && error.response.data.conflicts.length > 0) {
+							msg += ' Affected files: ' + error.response.data.conflicts.join(', ');
+						}
+						self.syncMessage = msg;
 						self.syncMessageClass = 'bg-rose-500';
 						self.fetchHistoryForConnection(connectionId);
-						self.fetchStatus(connectionId);
+						if (error.response.data.conflicts && error.response.data.conflicts.length > 0) {
+							// expand the status view with the resolve section
+							self.openResolve(connectionId);
+						} else {
+							self.fetchStatus(connectionId);
+						}
 					}
 				});
 		}

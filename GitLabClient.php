@@ -126,11 +126,16 @@ class GitLabClient extends GitPlatformClient
                 $status = 'renamed';
             }
 
-            $files[] = [
-                'filename' => $diff['new_path'] ?? $diff['old_path'],
+            $entry = [
+                'filename' => $diff['new_path'] ?? $diff['old_path'] ?? '',
                 'status' => $status,
                 'sha' => null
             ];
+            # Renames carry the old path in old_path
+            if ($status === 'renamed' && isset($diff['old_path'])) {
+                $entry['previous_filename'] = $diff['old_path'];
+            }
+            $files[] = $entry;
         }
         return $files;
     }
@@ -201,5 +206,35 @@ class GitLabClient extends GitPlatformClient
             'sha' => $data['blob_id'] ?? $data['commit_id'] ?? null,
             'commit_sha' => $data['commit_id'] ?? $data['blob_id'] ?? null
         ];
+    }
+
+    public function deleteFile(string $path, string $message, ?string $existingSha = null)
+    {
+        $project = $this->getProjectPath();
+        $encodedPath = urlencode($path);
+        $url = "{$this->apiBaseUrl}/projects/{$project}/repository/files/{$encodedPath}";
+
+        $payload = [
+            'branch' => $this->branch,
+            'commit_message' => $message
+        ];
+
+        $response = $this->makeRequest('DELETE', $url, $this->getAuthHeaders(), $payload);
+        if ($response === false) {
+            return false;
+        }
+
+        # GitLab answers with "204 No Content" and an empty body on success
+        $httpCode = $this->getLastHttpCode();
+        if (trim($response) === '' && $httpCode >= 200 && $httpCode < 300) {
+            return ['commit_sha' => null];
+        }
+
+        $data = $this->parseResponse($response);
+        if (!$data) {
+            return false;
+        }
+
+        return ['commit_sha' => null];
     }
 }
